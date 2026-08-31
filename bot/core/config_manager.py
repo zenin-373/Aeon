@@ -82,6 +82,8 @@ class Config:
     HEROKU_APP_NAME: str = ""
     HEROKU_API_KEY: str = ""
     NAME_PREFIX: str = ""
+    # HStream (/hs only) — dump channel for hstream.moe; unused by /leech /mirror
+    HSTREAM_CHANNEL: str = ""
 
     @classmethod
     def _convert(cls, key, value):
