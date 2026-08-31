@@ -180,6 +180,11 @@ def add_handlers():
             BotCommands.YtdlLeechCommand,
             CustomFilters.authorized,
         ),
+        "hstream_leech": (
+            hstream_leech,
+            BotCommands.HsCommand,
+            CustomFilters.authorized,
+        ),
         "mediainfo": (
             mediainfo,
             BotCommands.MediaInfoCommand,
