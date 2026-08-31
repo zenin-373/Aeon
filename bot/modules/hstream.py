@@ -8,6 +8,7 @@ Does not use LEECH_DUMP_CHAT and does not affect /leech or /mirror.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -21,10 +22,15 @@ from bot.helper.ext_utils.hstream_extractor import (
     process_url,
     scrape_series_info,
 )
-from bot.helper.ext_utils.hstream_thumb import download_poster_thumb, resolve_doc_thumb
+from bot.helper.ext_utils.hstream_thumb import (
+    download_poster_thumb,
+    resolve_doc_thumb,
+)
 from bot.helper.telegram_helper.message_utils import edit_message, send_message
 
-URL_RE = re.compile(r"https?://(?:www\.)?hstream\.moe/hentai/[\w\-]+/?", re.I)
+URL_RE = re.compile(
+    r"https?://(?:www\.)?hstream\.moe/hentai/[\w\-]+/?", re.IGNORECASE
+)
 _executor = ThreadPoolExecutor(max_workers=2)
 
 
@@ -64,10 +70,8 @@ def _parse_channel(raw: str):
 
 
 async def _safe_edit(msg, text: str):
-    try:
+    with contextlib.suppress(Exception):
         await edit_message(msg, text)
-    except Exception:
-        pass
 
 
 @new_task
@@ -212,12 +216,12 @@ async def hstream_leech(_, message):
                 thumb = None
 
             try:
-                kwargs = dict(
-                    chat_id=dest_chat,
-                    document=str(final_path),
-                    file_name=final_path.name,
-                    caption=caption,
-                )
+                kwargs = {
+                    "chat_id": dest_chat,
+                    "document": str(final_path),
+                    "file_name": final_path.name,
+                    "caption": caption,
+                }
                 if thumb:
                     kwargs["thumb"] = thumb
                 await TgClient.bot.send_document(**kwargs)
@@ -225,9 +229,7 @@ async def hstream_leech(_, message):
                 LOGGER.exception("HStream upload failed")
                 await send_message(message, f"⚠️ Upload failed: {e}")
             finally:
-                try:
+                with contextlib.suppress(Exception):
                     final_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
 
     await _safe_edit(status, f"🎉 HStream done — {total} episode(s).")
