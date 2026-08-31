@@ -3,17 +3,21 @@
 
 Posts ONLY to Config.HSTREAM_CHANNEL (when set).
 Does not use LEECH_DUMP_CHAT and does not affect /leech or /mirror.
+
+Document thumbs use the same settings as Aeon leech:
+  user custom thumbnails/{uid}.jpg → THUMBNAIL_LAYOUT → video frame.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-from bot import LOGGER
+from aiofiles.os import path as aiopath
+
+from bot import LOGGER, user_data
 from bot.core.config_manager import Config
 from bot.core.telegram_manager import TgClient
 from bot.helper.ext_utils.bot_utils import new_task
@@ -22,15 +26,13 @@ from bot.helper.ext_utils.hstream_extractor import (
     process_url,
     scrape_series_info,
 )
-from bot.helper.ext_utils.hstream_thumb import (
-    download_poster_thumb,
-    resolve_doc_thumb,
+from bot.helper.ext_utils.media_utils import (
+    get_multiple_frames_thumbnail,
+    get_video_thumbnail,
 )
 from bot.helper.telegram_helper.message_utils import edit_message, send_message
 
-URL_RE = re.compile(
-    r"https?://(?:www\.)?hstream\.moe/hentai/[\w\-]+/?", re.IGNORECASE
-)
+URL_RE = re.compile(r"https?://(?:www\.)?hstream\.moe/hentai/[\w\-]+/?", re.I)
 _executor = ThreadPoolExecutor(max_workers=2)
 
 
@@ -70,8 +72,37 @@ def _parse_channel(raw: str):
 
 
 async def _safe_edit(msg, text: str):
-    with contextlib.suppress(Exception):
+    try:
         await edit_message(msg, text)
+    except Exception:
+        pass
+
+
+async def _aeon_leech_thumb(uid: int, video_path: Path):
+    """Same thumb priority as TelegramUploader / user leech settings."""
+    user_dict = user_data.get(uid, {})
+    user_thumb = f"thumbnails/{uid}.jpg"
+    if await aiopath.exists(user_thumb):
+        return user_thumb
+
+    layout = user_dict.get("THUMBNAIL_LAYOUT")
+    if layout is None and "THUMBNAIL_LAYOUT" not in user_dict:
+        layout = Config.THUMBNAIL_LAYOUT or None
+    if layout:
+        try:
+            thumb = await get_multiple_frames_thumbnail(
+                str(video_path), layout, False
+            )
+            if thumb:
+                return thumb
+        except Exception as e:
+            LOGGER.warning("HStream layout thumb failed: %s", e)
+
+    try:
+        return await get_video_thumbnail(str(video_path), None)
+    except Exception as e:
+        LOGGER.warning("HStream video thumb failed: %s", e)
+        return None
 
 
 @new_task
@@ -79,6 +110,7 @@ async def hstream_leech(_, message):
     """
     /hs <hstream.moe episode url(s)>
     Download + optional Eng sub remux, upload to HSTREAM_CHANNEL only.
+    Thumbs follow Aeon /settings leech thumbnail options.
     """
     text = message.text or message.caption or ""
     parts = text.split(maxsplit=1)
@@ -94,7 +126,8 @@ async def hstream_leech(_, message):
             message,
             "Usage: <code>/hs https://hstream.moe/hentai/title-1</code>\n"
             "Or reply to a message that contains episode link(s).\n\n"
-            "Uploads go to <b>HSTREAM_CHANNEL</b> only (bot settings → Config). "
+            "Uploads go to <b>HSTREAM_CHANNEL</b> only (bot settings → Config).\n"
+            "Thumbs use your Aeon leech settings (/settings → thumbnail).\n"
             "Does not affect /leech or /mirror.",
         )
         return
@@ -152,17 +185,6 @@ async def hstream_leech(_, message):
         if info.episodes:
             series_caption += f"\n📑 Episodes: {info.episodes}"
 
-        thumb_dir = work / "_thumbs" / series_key.rstrip("/").split("/")[-1]
-        series_thumb = None
-        if info.poster_url:
-            try:
-                series_thumb = await loop.run_in_executor(
-                    _executor,
-                    lambda: download_poster_thumb(info.poster_url, thumb_dir),
-                )
-            except Exception:
-                series_thumb = None
-
         try:
             if info.poster_url:
                 await TgClient.bot.send_photo(
@@ -206,22 +228,15 @@ async def hstream_leech(_, message):
                 f"📤 [{idx}/{total}] uploading…\n<code>{final_path.name}</code>",
             )
 
-            thumb = None
-            try:
-                thumb = await loop.run_in_executor(
-                    _executor,
-                    lambda: resolve_doc_thumb(final_path, series_thumb, thumb_dir),
-                )
-            except Exception:
-                thumb = None
+            thumb = await _aeon_leech_thumb(uid, final_path)
 
             try:
-                kwargs = {
-                    "chat_id": dest_chat,
-                    "document": str(final_path),
-                    "file_name": final_path.name,
-                    "caption": caption,
-                }
+                kwargs = dict(
+                    chat_id=dest_chat,
+                    document=str(final_path),
+                    file_name=final_path.name,
+                    caption=caption,
+                )
                 if thumb:
                     kwargs["thumb"] = thumb
                 await TgClient.bot.send_document(**kwargs)
@@ -229,7 +244,9 @@ async def hstream_leech(_, message):
                 LOGGER.exception("HStream upload failed")
                 await send_message(message, f"⚠️ Upload failed: {e}")
             finally:
-                with contextlib.suppress(Exception):
+                try:
                     final_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
 
     await _safe_edit(status, f"🎉 HStream done — {total} episode(s).")
