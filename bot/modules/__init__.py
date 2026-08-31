@@ -39,6 +39,7 @@ from .users_settings import (
     send_user_settings,
 )
 from .ytdlp import ytdl, ytdl_leech
+from .hstream import hstream_leech
 
 __all__ = [
     "add_sudo",
@@ -97,4 +98,5 @@ __all__ = [
     "unauthorize",
     "ytdl",
     "ytdl_leech",
+    "hstream_leech",
 ]
