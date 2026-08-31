@@ -11,6 +11,7 @@ Document thumbs use the same settings as Aeon leech:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -32,7 +33,9 @@ from bot.helper.ext_utils.media_utils import (
 )
 from bot.helper.telegram_helper.message_utils import edit_message, send_message
 
-URL_RE = re.compile(r"https?://(?:www\.)?hstream\.moe/hentai/[\w\-]+/?", re.I)
+URL_RE = re.compile(
+    r"https?://(?:www\.)?hstream\.moe/hentai/[\w\-]+/?", re.IGNORECASE
+)
 _executor = ThreadPoolExecutor(max_workers=2)
 
 
@@ -72,10 +75,8 @@ def _parse_channel(raw: str):
 
 
 async def _safe_edit(msg, text: str):
-    try:
+    with contextlib.suppress(Exception):
         await edit_message(msg, text)
-    except Exception:
-        pass
 
 
 async def _aeon_leech_thumb(uid: int, video_path: Path):
@@ -231,12 +232,12 @@ async def hstream_leech(_, message):
             thumb = await _aeon_leech_thumb(uid, final_path)
 
             try:
-                kwargs = dict(
-                    chat_id=dest_chat,
-                    document=str(final_path),
-                    file_name=final_path.name,
-                    caption=caption,
-                )
+                kwargs = {
+                    "chat_id": dest_chat,
+                    "document": str(final_path),
+                    "file_name": final_path.name,
+                    "caption": caption,
+                }
                 if thumb:
                     kwargs["thumb"] = thumb
                 await TgClient.bot.send_document(**kwargs)
@@ -244,9 +245,7 @@ async def hstream_leech(_, message):
                 LOGGER.exception("HStream upload failed")
                 await send_message(message, f"⚠️ Upload failed: {e}")
             finally:
-                try:
+                with contextlib.suppress(Exception):
                     final_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
 
     await _safe_edit(status, f"🎉 HStream done — {total} episode(s).")
