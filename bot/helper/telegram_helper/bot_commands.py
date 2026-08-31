@@ -45,3 +45,4 @@ class BotCommands:
     SelectCommand = f"sel{i}"
     RssCommand = f"rss{i}"
     SoxCommand = [f"spectrum{i}", f"sox{i}"]
+    HsCommand = [f"hs{i}", f"hstream{i}"]  # hstream.moe leech → HSTREAM_CHANNEL only
