@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Core download + subtitle remux for /hs (hstream.moe)."""
+
 from __future__ import annotations
 
+import contextlib
 import html as html_lib
 import re
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional
 from urllib.parse import unquote
 
 import requests
@@ -25,27 +27,25 @@ class SeriesInfo:
     release_date: str = ""
     upload_date: str = ""
     studio: str = ""
-    tags: List[str] = field(default_factory=list)
-    episodes: Optional[int] = None
+    tags: list[str] = field(default_factory=list)
+    episodes: int | None = None
     description: str = ""
     poster_url: str = ""
     series_url: str = ""
     status: str = ""
 
 
-def ensure_dependencies(progress: Optional[ProgressCallback] = None) -> None:
+def ensure_dependencies(progress: ProgressCallback | None = None) -> None:
     def log(msg: str) -> None:
         if progress:
             progress(msg)
 
-    try:
+    with contextlib.suppress(Exception):
         subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q", "yt-dlp", "requests"],
             check=False,
             capture_output=True,
         )
-    except Exception:
-        pass
 
 
 def _human_bytes(n: float) -> str:
@@ -58,15 +58,15 @@ def _human_bytes(n: float) -> str:
 
 def _progress_bar(pct: float, width: int = 10) -> str:
     pct = max(0.0, min(100.0, pct))
-    filled = int(round(width * pct / 100.0))
+    filled = round(width * pct / 100.0)
     return "●" * filled + "○" * (width - filled)
 
 
 def download_video(
     url: str,
     dest: Path,
-    cookies_file: Optional[Path] = None,
-    progress: Optional[ProgressCallback] = None,
+    cookies_file: Path | None = None,
+    progress: ProgressCallback | None = None,
 ) -> Path:
     def log(msg: str) -> None:
         if progress:
@@ -101,7 +101,11 @@ def download_video(
             name = d.get("filename") or last_filename[0] or "download"
             last_filename[0] = name
             short = Path(name).name if name else "download"
-            eta_s = f"{int(eta)}s" if isinstance(eta, (int, float)) and eta is not None else "—"
+            eta_s = (
+                f"{int(eta)}s"
+                if isinstance(eta, (int, float)) and eta is not None
+                else "—"
+            )
             bar = _progress_bar(pct)
             progress(
                 f"📥 <b>Download</b>\n<code>{short}</code>\n"
@@ -114,7 +118,7 @@ def download_video(
             name = d.get("filename") or last_filename[0] or "file"
             progress(f"✅ Download finished\n<code>{Path(name).name}</code>")
 
-    last_err: Optional[Exception] = None
+    last_err: Exception | None = None
     log(f"Downloading: {url}")
     for fmt in format_tries:
         ydl_opts = {
@@ -131,7 +135,9 @@ def download_video(
         }
         if shutil.which("aria2c"):
             ydl_opts["external_downloader"] = "aria2c"
-            ydl_opts["external_downloader_args"] = {"aria2c": ["-x", "16", "-s", "16", "-k", "1M"]}
+            ydl_opts["external_downloader_args"] = {
+                "aria2c": ["-x", "16", "-s", "16", "-k", "1M"]
+            }
         if cookies_file and cookies_file.exists():
             ydl_opts["cookiefile"] = str(cookies_file)
         try:
@@ -145,7 +151,12 @@ def download_video(
             continue
     if last_err is not None:
         raise RuntimeError(f"Download failed: {last_err}") from last_err
-    files = [p for p in dest.glob("*") if p.is_file() and p.suffix.lower() not in {".ass", ".part", ".ytdl", ".temp"}]
+    files = [
+        p
+        for p in dest.glob("*")
+        if p.is_file()
+        and p.suffix.lower() not in {".ass", ".part", ".ytdl", ".temp"}
+    ]
     if not files:
         raise FileNotFoundError("No video file produced by yt-dlp.")
     return max(files, key=lambda p: p.stat().st_ctime)
@@ -165,7 +176,7 @@ def download_subtitle(sub_url: str, sub_path: Path) -> bool:
         return False
 
 
-def _cookies_header(cookies_file: Optional[Path]) -> Optional[str]:
+def _cookies_header(cookies_file: Path | None) -> str | None:
     if not cookies_file or not cookies_file.is_file():
         return None
     parts = []
@@ -180,9 +191,9 @@ def _cookies_header(cookies_file: Optional[Path]) -> Optional[str]:
 
 def resolve_subtitle_url(
     page_url: str,
-    cookies_file: Optional[Path] = None,
-    progress: Optional[ProgressCallback] = None,
-) -> Optional[str]:
+    cookies_file: Path | None = None,
+    progress: ProgressCallback | None = None,
+) -> str | None:
     def log(msg: str) -> None:
         if progress:
             progress(msg)
@@ -200,8 +211,11 @@ def resolve_subtitle_url(
         if r.status_code == 200:
             html = r.text
             found = []
-            for pat in [r'href=["\'](https?://[^"\']+?/eng\.ass)["\']', r'href=["\'](https?://[^"\']+?\.ass)["\']']:
-                for m in re.finditer(pat, html, re.I):
+            for pat in [
+                r'href=["\'](https?://[^"\']+?/eng\.ass)["\']',
+                r'href=["\'](https?://[^"\']+?\.ass)["\']',
+            ]:
+                for m in re.finditer(pat, html, re.IGNORECASE):
                     if m.group(1) not in found:
                         found.append(m.group(1))
             for u in found:
@@ -215,7 +229,7 @@ def resolve_subtitle_url(
         m = re.search(
             r'id=["\']e_id["\'][^>]*value=["\']([^"\']+)["\']|value=["\']([^"\']+)["\'][^>]*id=["\']e_id["\']',
             html or "",
-            re.I,
+            re.IGNORECASE,
         )
         e_id = (m.group(1) or m.group(2)) if m else None
         if not e_id:
@@ -229,7 +243,12 @@ def resolve_subtitle_url(
                 if part.upper().startswith("XSRF-TOKEN="):
                     api["X-XSRF-TOKEN"] = unquote(part.split("=", 1)[1])
                     break
-        resp = requests.post("https://hstream.moe/player/api", headers=api, json={"episode_id": e_id}, timeout=30)
+        resp = requests.post(
+            "https://hstream.moe/player/api",
+            headers=api,
+            json={"episode_id": e_id},
+            timeout=30,
+        )
         if resp.status_code != 200:
             return None
         data = resp.json()
@@ -249,9 +268,25 @@ def resolve_subtitle_url(
 
 def remux_to_mkv(video_path: Path, sub_path: Path, output_mkv: Path) -> None:
     subprocess.run(
-        ["ffmpeg", "-y", "-i", str(video_path), "-i", str(sub_path),
-         "-map", "0", "-map", "1", "-c", "copy", "-metadata:s:s:0", "language=eng", str(output_mkv)],
-        check=True, capture_output=True,
+        [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(video_path),
+            "-i",
+            str(sub_path),
+            "-map",
+            "0",
+            "-map",
+            "1",
+            "-c",
+            "copy",
+            "-metadata:s:s:0",
+            "language=eng",
+            str(output_mkv),
+        ],
+        check=True,
+        capture_output=True,
     )
 
 
@@ -268,8 +303,8 @@ def episode_url_to_series_url(episode_url: str) -> str:
 
 def scrape_series_info(
     episode_or_series_url: str,
-    cookies_file: Optional[Path] = None,
-    progress: Optional[ProgressCallback] = None,
+    cookies_file: Path | None = None,
+    progress: ProgressCallback | None = None,
 ) -> SeriesInfo:
     def log(msg: str) -> None:
         if progress:
@@ -293,21 +328,27 @@ def scrape_series_info(
     except Exception:
         return info
 
-    m = re.search(r"<h1[^>]*>(.*?)</h1>", page, re.I | re.S)
+    m = re.search(r"<h1[^>]*>(.*?)</h1>", page, re.IGNORECASE | re.DOTALL)
     if m:
         info.title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
     if not info.title:
         m = re.search(r'property="og:title"\s+content="([^"]+)"', page)
         if m:
-            info.title = re.sub(r"\s*-\s*Watch All.*$", "", html_lib.unescape(m.group(1))).strip()
+            info.title = re.sub(
+                r"\s*-\s*Watch All.*$", "", html_lib.unescape(m.group(1))
+            ).strip()
     dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", page)
     if dates:
-        info.year = sorted(set(dates))[0][:4]
-    m = re.search(r"Episodes\s*\((\d+)\)", page, re.I)
+        info.year = min(set(dates))[:4]
+    m = re.search(r"Episodes\s*\((\d+)\)", page, re.IGNORECASE)
     if m:
         info.episodes = int(m.group(1))
         info.status = "Completed"
-    covers = re.findall(r'((?:https://hstream\.moe)?/images/hentai/[^"\']+/cover[^"\']+\.webp)', page, re.I)
+    covers = re.findall(
+        r'((?:https://hstream\.moe)?/images/hentai/[^"\']+/cover[^"\']+\.webp)',
+        page,
+        re.IGNORECASE,
+    )
     if covers:
         u = covers[0]
         info.poster_url = u if u.startswith("http") else f"https://hstream.moe{u}"
@@ -322,10 +363,10 @@ def scrape_series_info(
 def process_url(
     url: str,
     dest: Path,
-    series_slug: Optional[str] = None,
+    series_slug: str | None = None,
     year: str = "2024",
-    cookies_file: Optional[Path] = None,
-    progress: Optional[ProgressCallback] = None,
+    cookies_file: Path | None = None,
+    progress: ProgressCallback | None = None,
 ) -> Path:
     def log(msg: str) -> None:
         if progress:
@@ -333,7 +374,9 @@ def process_url(
 
     folder = dest / series_folder_name(url)
     folder.mkdir(parents=True, exist_ok=True)
-    video_path = download_video(url, folder, cookies_file=cookies_file, progress=progress)
+    video_path = download_video(
+        url, folder, cookies_file=cookies_file, progress=progress
+    )
     base_name = video_path.stem
     final_mkv = folder / f"{base_name}.mkv"
     if video_path.suffix.lower() == ".mkv":
@@ -346,7 +389,9 @@ def process_url(
     sub_path = folder / f"{base_name}.ass"
     sub_ok = False
     log("Resolving subtitle…")
-    live_sub = resolve_subtitle_url(url, cookies_file=cookies_file, progress=progress)
+    live_sub = resolve_subtitle_url(
+        url, cookies_file=cookies_file, progress=progress
+    )
     if live_sub and download_subtitle(live_sub, sub_path):
         sub_ok = True
     if not sub_ok:
