@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """Document / video thumbnail helpers (Aeon-style leech thumbs)."""
+
 from __future__ import annotations
 
 import logging
 import subprocess
-from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING
 
 import requests
 
+if TYPE_CHECKING:
+    from pathlib import Path
+
 logger = logging.getLogger("hstream-tg")
 
-def download_poster_thumb(poster_url: str, dest_dir: Path) -> Optional[Path]:
+
+def download_poster_thumb(poster_url: str, dest_dir: Path) -> Path | None:
     if not poster_url:
         return None
     dest_dir.mkdir(parents=True, exist_ok=True)
@@ -27,10 +31,17 @@ def download_poster_thumb(poster_url: str, dest_dir: Path) -> Optional[Path]:
                         f.write(chunk)
         subprocess.run(
             [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-i", str(raw),
-                "-vf", "scale=320:-1",
-                "-q:v", "5",
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(raw),
+                "-vf",
+                "scale=320:-1",
+                "-q:v",
+                "5",
                 str(out),
             ],
             check=True,
@@ -45,18 +56,27 @@ def download_poster_thumb(poster_url: str, dest_dir: Path) -> Optional[Path]:
     return None
 
 
-def extract_video_thumb(video_path: Path, dest_dir: Path) -> Optional[Path]:
+def extract_video_thumb(video_path: Path, dest_dir: Path) -> Path | None:
     dest_dir.mkdir(parents=True, exist_ok=True)
     out = dest_dir / f"{video_path.stem}_thumb.jpg"
     try:
         subprocess.run(
             [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-ss", "5",
-                "-i", str(video_path),
-                "-vf", "scale=320:-1",
-                "-vframes", "1",
-                "-q:v", "5",
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-ss",
+                "5",
+                "-i",
+                str(video_path),
+                "-vf",
+                "scale=320:-1",
+                "-vframes",
+                "1",
+                "-q:v",
+                "5",
                 str(out),
             ],
             check=True,
@@ -70,11 +90,19 @@ def extract_video_thumb(video_path: Path, dest_dir: Path) -> Optional[Path]:
     try:
         subprocess.run(
             [
-                "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-                "-i", str(video_path),
-                "-vf", "scale=320:-1",
-                "-vframes", "1",
-                "-q:v", "5",
+                "ffmpeg",
+                "-y",
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-i",
+                str(video_path),
+                "-vf",
+                "scale=320:-1",
+                "-vframes",
+                "1",
+                "-q:v",
+                "5",
                 str(out),
             ],
             check=True,
@@ -90,9 +118,9 @@ def extract_video_thumb(video_path: Path, dest_dir: Path) -> Optional[Path]:
 
 def resolve_doc_thumb(
     video_path: Path,
-    series_thumb: Optional[Path],
+    series_thumb: Path | None,
     work_dir: Path,
-) -> Optional[str]:
+) -> str | None:
     if series_thumb and series_thumb.exists():
         return str(series_thumb)
     thumb = extract_video_thumb(video_path, work_dir)
