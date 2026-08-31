@@ -1,4 +1,3 @@
-from re import IGNORECASE, escape, search
 from time import time
 from uuid import uuid4
 
@@ -12,7 +11,6 @@ from bot.core.config_manager import Config
 from bot.core.telegram_manager import TgClient
 from bot.helper.aeon_utils.shorteners import short
 from bot.helper.ext_utils.db_handler import database
-from bot.helper.ext_utils.help_messages import nsfw_keywords
 from bot.helper.ext_utils.status_utils import get_readable_time
 from bot.helper.telegram_helper.button_build import ButtonMaker
 
@@ -125,71 +123,18 @@ async def get_chat_info(channel_id):
 
 
 def is_nsfw(text):
-    """Checks if the given text contains NSFW keywords.
-
-    Args:
-        text: The text to check.
-
-    Returns:
-        True if NSFW keywords are found, False otherwise.
-    """
-    pattern = (
-        r"(?:^|\W|_)(?:"
-        + "|".join(escape(keyword) for keyword in nsfw_keywords)
-        + r")(?:$|\W|_)"
-    )
-    return bool(search(pattern, text, flags=IGNORECASE))
+    """NSFW check disabled - always returns False."""
+    return False
 
 
 def is_nsfw_data(data):
-    """Checks if the given data (list or dict from torrent info) contains NSFW content.
-
-    Args:
-        data: A list of items (strings or dicts with 'name') or a dict
-              with 'contents' (list of dicts with 'filename').
-
-    Returns:
-        True if NSFW content is found, False otherwise.
-    """
-    if isinstance(data, list):
-        return any(
-            is_nsfw(item.get("name", ""))
-            if isinstance(item, dict)
-            else is_nsfw(item)
-            for item in data
-        )
-    if isinstance(data, dict):
-        return any(is_nsfw(item["filename"]) for item in data.get("contents", []))
+    """NSFW check disabled - always returns False."""
     return False
 
 
 async def nsfw_precheck(message):
-    """Performs a pre-check for NSFW content in the message text or replied-to message.
-
-    Args:
-        message: The Pyrogram message object.
-
-    Returns:
-        True if NSFW content is detected, False otherwise.
-    """
-    if is_nsfw(message.text):
-        return True
-
-    reply_to = message.reply_to_message
-    if not reply_to:
-        return False
-
-    for attr in ["document", "video"]:
-        if hasattr(reply_to, attr) and getattr(reply_to, attr):
-            file_name = getattr(reply_to, attr).file_name
-            if file_name and is_nsfw(file_name):
-                return True
-
-    return any(
-        is_nsfw(getattr(reply_to, attr))
-        for attr in ["caption", "text"]
-        if hasattr(reply_to, attr) and getattr(reply_to, attr)
-    )
+    """NSFW check disabled - always returns False."""
+    return False
 
 
 async def check_is_paid(chat, uid):
