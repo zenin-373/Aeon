@@ -9,6 +9,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -72,17 +73,28 @@ def _progress_bar(pct: float, width: int = 10) -> str:
     return "●" * filled + "○" * (width - filled)
 
 
-def _cookies_header(cookies_file: Path | None) -> str | None:
-    if not cookies_file or not cookies_file.is_file():
-        return None
-    parts = []
-    for line in cookies_file.read_text(errors="ignore").splitlines():
-        if not line or line.startswith("#"):
-            continue
-        cols = line.split("\t")
-        if len(cols) >= 7 and "hstream.moe" in cols[0]:
-            parts.append(f"{cols[5]}={cols[6]}")
-    return "; ".join(parts) if parts else None
+def _session(cookies_file: Path | None = None) -> requests.Session:
+    s = requests.Session()
+    s.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://hstream.moe/",
+            "Origin": "https://hstream.moe",
+        }
+    )
+    if cookies_file and cookies_file.is_file():
+        for line in cookies_file.read_text(errors="ignore").splitlines():
+            if not line or line.startswith("#"):
+                continue
+            cols = line.split("\t")
+            if len(cols) >= 7 and "hstream.moe" in cols[0]:
+                s.cookies.set(
+                    cols[5], cols[6], domain="hstream.moe", path=cols[2] or "/"
+                )
+    return s
 
 
 def resolve_stream_urls(
@@ -90,28 +102,19 @@ def resolve_stream_urls(
     cookies_file: Path | None = None,
     progress: ProgressCallback | None = None,
 ) -> list[str]:
-    """Direct media URLs via /player/api — stock yt-dlp cannot extract hstream.moe."""
+    """Resolve progressive/DASH URLs via live session + /player/api (needs XSRF)."""
 
     def log(msg: str) -> None:
         if progress:
             progress(msg)
 
-    ch = _cookies_header(cookies_file)
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://hstream.moe/",
-    }
-    if ch:
-        headers["Cookie"] = ch
-
-    html = ""
+    s = _session(cookies_file)
     try:
-        r = requests.get(page_url, headers=headers, timeout=30)
-        if r.status_code == 200:
-            html = r.text
+        r = s.get(page_url, timeout=30)
+        if r.status_code != 200:
+            log(f"page HTTP {r.status_code}")
+            return []
+        html = r.text
     except Exception as e:
         log(f"page fetch failed: {e}")
         return []
@@ -119,40 +122,33 @@ def resolve_stream_urls(
     m = re.search(
         r'id=["\']e_id["\'][^>]*value=["\']([^"\']+)["\']'
         r'|value=["\']([^"\']+)["\'][^>]*id=["\']e_id["\']',
-        html or "",
-        re.IGNORECASE,
+        html,
+        re.I,
     )
     e_id = (m.group(1) or m.group(2)) if m else None
     if not e_id:
         log("no e_id on page")
         return []
 
-    api = dict(headers)
-    api["Content-Type"] = "application/json"
-    api["X-Requested-With"] = "XMLHttpRequest"
-    if ch:
-        for part in ch.split(";"):
-            part = part.strip()
-            if part.upper().startswith("XSRF-TOKEN="):
-                api["X-XSRF-TOKEN"] = unquote(part.split("=", 1)[1])
-                break
-
+    xsrf = s.cookies.get("XSRF-TOKEN")
+    token = unquote(xsrf) if xsrf else ""
+    headers = {
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "X-XSRF-TOKEN": token,
+        "Referer": page_url,
+        "Origin": "https://hstream.moe",
+        "Accept": "application/json",
+    }
     try:
-        resp = requests.post(
+        resp = s.post(
             "https://hstream.moe/player/api",
-            headers=api,
-            json={"episode_id": e_id},
+            headers=headers,
+            json={"episode_id": str(e_id)},
             timeout=30,
         )
         if resp.status_code != 200:
-            resp = requests.post(
-                "https://hstream.moe/player/api",
-                headers=api,
-                data={"episode_id": e_id},
-                timeout=30,
-            )
-        if resp.status_code != 200:
-            log(f"player API HTTP {resp.status_code}")
+            log(f"player API HTTP {resp.status_code}: {resp.text[:120]}")
             return []
         data = resp.json()
     except Exception as e:
@@ -161,7 +157,6 @@ def resolve_stream_urls(
 
     stream_url = data.get("stream_url") or data.get("streamUrl") or ""
     domains = data.get("stream_domains") or data.get("streamDomains") or []
-    resolution = str(data.get("resolution") or "720p").lower()
     if isinstance(domains, str):
         domains = [domains]
     if not stream_url or not domains:
@@ -173,23 +168,63 @@ def resolve_stream_urls(
         domain = "https://" + domain.lstrip("/")
     base = f"{domain.rstrip('/')}/{stream_url.strip('/')}"
 
-    candidates: list[str] = []
-    if "4k" in resolution or "2160" in resolution or "1080" in resolution:
-        candidates += [
-            f"{base}/av1.1080p.webm",
-            f"{base}/1080/manifest.mpd",
-            f"{base}/x264.720p.mp4",
-            f"{base}/720/manifest.mpd",
-        ]
-    else:
-        candidates += [
-            f"{base}/x264.720p.mp4",
-            f"{base}/720/manifest.mpd",
-            f"{base}/av1.1080p.webm",
-            f"{base}/1080/manifest.mpd",
-        ]
-    log(f"resolved {len(candidates)} stream candidate(s)")
+    candidates = [
+        f"{base}/x264.720p.mp4",
+        f"{base}/av1.1080p.webm",
+        f"{base}/720/manifest.mpd",
+        f"{base}/1080/manifest.mpd",
+        f"{base}/av1.720p.webm",
+    ]
+    log(f"resolved {len(candidates)} stream(s)")
     return candidates
+
+
+def _download_http(
+    url: str,
+    dest_file: Path,
+    progress: ProgressCallback | None = None,
+) -> Path:
+    """Direct progressive download (mp4/webm) with Referer."""
+
+    def log(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://hstream.moe/",
+        "Origin": "https://hstream.moe",
+    }
+    log(f"HTTP download: {url.split('/')[-1]}")
+    with requests.get(url, headers=headers, stream=True, timeout=60) as r:
+        r.raise_for_status()
+        total = int(r.headers.get("content-length") or 0)
+        done = 0
+        last = 0.0
+        with open(dest_file, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1024 * 256):
+                if not chunk:
+                    continue
+                f.write(chunk)
+                done += len(chunk)
+                now = time.time()
+                if progress and (now - last > 1.2 or (total and done >= total)):
+                    last = now
+                    pct = (100.0 * done / total) if total else 0.0
+                    progress(
+                        f"📥 <b>Download</b>\n"
+                        f"<code>{dest_file.name}</code>\n"
+                        f"{_progress_bar(pct)} <b>{pct:.1f}%</b>\n"
+                        f"Processed: {_human_bytes(done)}\n"
+                        f"Size: {_human_bytes(total) if total else '—'}\n"
+                        f"Tool: http"
+                    )
+    if not dest_file.exists() or dest_file.stat().st_size < 1000:
+        raise RuntimeError(f"HTTP download too small/failed: {url}")
+    return dest_file
 
 
 def download_video(
@@ -198,18 +233,45 @@ def download_video(
     cookies_file: Path | None = None,
     progress: ProgressCallback | None = None,
 ) -> Path:
-    """Download via hanime-plugin and/or player-API direct streams."""
+    """Prefer player-API progressive files; yt-dlp only as secondary."""
 
     def log(msg: str) -> None:
         if progress:
             progress(msg)
 
-    import time
+    dest.mkdir(parents=True, exist_ok=True)
+    log(f"Downloading: {url}")
+
+    streams = resolve_stream_urls(url, cookies_file=cookies_file, progress=progress)
+    last_err: Exception | None = None
+
+    for s in streams:
+        if not (s.endswith(".mp4") or s.endswith(".webm")):
+            continue
+        name = s.rstrip("/").split("/")[-1]
+        slug = url.rstrip("/").split("/")[-1]
+        out = dest / f"{slug}-{name}"
+        try:
+            h = requests.head(
+                s,
+                headers={"Referer": "https://hstream.moe/"},
+                timeout=20,
+                allow_redirects=True,
+            )
+            if h.status_code >= 400:
+                continue
+            return _download_http(s, out, progress=progress)
+        except Exception as e:
+            last_err = e
+            log(f"HTTP fail {name}: {e}")
+            with contextlib.suppress(Exception):
+                out.unlink(missing_ok=True)
+            continue
 
     try:
         import yt_dlp
     except ImportError as e:
-        raise RuntimeError("yt-dlp is required") from e
+        raise RuntimeError(f"Download failed (no yt-dlp): {last_err}") from e
 
     with contextlib.suppress(Exception):
         subprocess.run(
@@ -228,108 +290,63 @@ def download_video(
         )
 
     output_template = str(dest / "%(title)s.%(ext)s")
-    format_tries = [
-        "best",
-        "bestvideo*+bestaudio/best",
-        "best[height<=1080]",
-        "best[height<=720]",
-    ]
-
+    try_urls = [u for u in streams if u.endswith(".mpd")] + [url]
     last_update = [0.0]
     last_filename = [""]
 
     def hook(d: dict) -> None:
         if not progress:
             return
-        status = d.get("status")
-        if status == "downloading":
+        if d.get("status") == "downloading":
             now = time.time()
-            if now - last_update[0] < 1.2 and d.get("downloaded_bytes", 0) > 0:
+            if now - last_update[0] < 1.2:
                 return
             last_update[0] = now
             total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
             done = d.get("downloaded_bytes") or 0
-            speed = d.get("speed") or 0
-            eta = d.get("eta")
             pct = (100.0 * done / total) if total else 0.0
             name = d.get("filename") or last_filename[0] or "download"
             last_filename[0] = name
-            short = Path(name).name if name else "download"
-            eta_s = (
-                f"{int(eta)}s"
-                if isinstance(eta, (int, float)) and eta is not None
-                else "—"
-            )
-            bar = _progress_bar(pct)
             progress(
-                f"📥 <b>Download</b>\n<code>{short}</code>\n"
-                f"{bar} <b>{pct:.2f}%</b>\n"
+                f"📥 <b>Download</b>\n<code>{Path(name).name}</code>\n"
+                f"{_progress_bar(pct)} <b>{pct:.1f}%</b>\n"
                 f"Processed: {_human_bytes(done)}\n"
                 f"Size: {_human_bytes(total) if total else '—'}\n"
-                f"Speed: {_human_bytes(speed)}/s\n"
-                f"ETA: {eta_s}\n"
                 f"Tool: yt-dlp"
             )
-        elif status == "finished":
-            name = d.get("filename") or last_filename[0] or "file"
-            last_filename[0] = name
-            progress(f"✅ Download finished\n<code>{Path(name).name}</code>")
-
-    last_err: Exception | None = None
-    log(f"Downloading: {url}")
-
-    try_urls: list[str] = [url]
-    try:
-        for s in resolve_stream_urls(
-            url, cookies_file=cookies_file, progress=progress
-        ):
-            if s not in try_urls:
-                try_urls.append(s)
-    except Exception as e:
-        log(f"stream resolve skipped: {e}")
 
     for try_url in try_urls:
-        for fmt in format_tries:
-            ydl_opts = {
-                "format": fmt,
-                "outtmpl": output_template,
-                "noplaylist": True,
-                "retries": 5,
-                "fragment_retries": 5,
-                "concurrent_fragment_downloads": 8,
-                "progress_hooks": [hook],
-                "quiet": True,
-                "no_warnings": True,
-                "noprogress": True,
-                "http_headers": {
-                    "Referer": "https://hstream.moe/",
-                    "Origin": "https://hstream.moe",
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/120.0.0.0 Safari/537.36"
-                    ),
-                },
-            }
-            if shutil.which("aria2c"):
-                ydl_opts["external_downloader"] = "aria2c"
-                ydl_opts["external_downloader_args"] = {
-                    "aria2c": ["-x", "16", "-s", "16", "-k", "1M"]
-                }
-            if cookies_file and cookies_file.exists():
-                ydl_opts["cookiefile"] = str(cookies_file)
-            try:
-                short = try_url if len(try_url) < 90 else try_url[:87] + "..."
-                log(f"  trying {short} · format={fmt}")
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([try_url])
-                last_err = None
-                break
-            except Exception as e:
-                last_err = e
-                continue
-        if last_err is None:
+        ydl_opts = {
+            "format": "best",
+            "outtmpl": output_template,
+            "noplaylist": True,
+            "retries": 5,
+            "fragment_retries": 5,
+            "concurrent_fragment_downloads": 8,
+            "progress_hooks": [hook],
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "http_headers": {
+                "Referer": "https://hstream.moe/",
+                "Origin": "https://hstream.moe",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+            },
+        }
+        if cookies_file and cookies_file.exists():
+            ydl_opts["cookiefile"] = str(cookies_file)
+        try:
+            log(f"  yt-dlp: {try_url[:90]}")
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([try_url])
+            last_err = None
             break
+        except Exception as e:
+            last_err = e
+            continue
 
     if last_err is not None:
         raise RuntimeError(f"Download failed: {last_err}") from last_err
@@ -337,24 +354,28 @@ def download_video(
     files = [
         p
         for p in dest.glob("*")
-        if p.is_file()
-        and p.suffix.lower() not in {".ass", ".part", ".ytdl", ".temp"}
+        if p.is_file() and p.suffix.lower() not in {".ass", ".part", ".ytdl", ".temp"}
     ]
     if not files:
-        raise FileNotFoundError("No video file produced by yt-dlp.")
+        raise FileNotFoundError("No video file produced.")
     return max(files, key=lambda p: p.stat().st_ctime)
 
 
 def download_subtitle(sub_url: str, sub_path: Path) -> bool:
     try:
-        with requests.get(sub_url, stream=True, timeout=30) as r:
+        with requests.get(
+            sub_url,
+            stream=True,
+            timeout=30,
+            headers={"Referer": "https://hstream.moe/"},
+        ) as r:
             if r.status_code != 200:
                 return False
             with open(sub_path, "wb") as f:
                 for chunk in r.iter_content(chunk_size=8192):
                     if chunk:
                         f.write(chunk)
-        return True
+        return sub_path.exists() and sub_path.stat().st_size > 10
     except Exception:
         return False
 
@@ -368,16 +389,10 @@ def resolve_subtitle_url(
         if progress:
             progress(msg)
 
-    ch = _cookies_header(cookies_file)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://hstream.moe/",
-    }
-    if ch:
-        headers["Cookie"] = ch
+    s = _session(cookies_file)
     html = ""
     try:
-        r = requests.get(page_url, headers=headers, timeout=30)
+        r = s.get(page_url, timeout=30)
         if r.status_code == 200:
             html = r.text
             found = []
@@ -385,7 +400,7 @@ def resolve_subtitle_url(
                 r'href=["\'](https?://[^"\']+?/eng\.ass)["\']',
                 r'href=["\'](https?://[^"\']+?\.ass)["\']',
             ]:
-                for m in re.finditer(pat, html, re.IGNORECASE):
+                for m in re.finditer(pat, html, re.I):
                     if m.group(1) not in found:
                         found.append(m.group(1))
             for u in found:
@@ -395,43 +410,44 @@ def resolve_subtitle_url(
                 return found[0]
     except Exception as e:
         log(f"page scrape failed: {e}")
+
     try:
         m = re.search(
             r'id=["\']e_id["\'][^>]*value=["\']([^"\']+)["\']|value=["\']([^"\']+)["\'][^>]*id=["\']e_id["\']',
             html or "",
-            re.IGNORECASE,
+            re.I,
         )
         e_id = (m.group(1) or m.group(2)) if m else None
         if not e_id:
             return None
-        api = dict(headers)
-        api["Content-Type"] = "application/json"
-        api["X-Requested-With"] = "XMLHttpRequest"
-        if ch:
-            for part in ch.split(";"):
-                part = part.strip()
-                if part.upper().startswith("XSRF-TOKEN="):
-                    api["X-XSRF-TOKEN"] = unquote(part.split("=", 1)[1])
-                    break
-        resp = requests.post(
+        xsrf = s.cookies.get("XSRF-TOKEN")
+        token = unquote(xsrf) if xsrf else ""
+        headers = {
+            "Content-Type": "application/json",
+            "X-Requested-With": "XMLHttpRequest",
+            "X-XSRF-TOKEN": token,
+            "Referer": page_url,
+            "Origin": "https://hstream.moe",
+        }
+        resp = s.post(
             "https://hstream.moe/player/api",
-            headers=api,
-            json={"episode_id": e_id},
+            headers=headers,
+            json={"episode_id": str(e_id)},
             timeout=30,
         )
         if resp.status_code != 200:
             return None
         data = resp.json()
-        stream_url = data.get("stream_url") or data.get("streamUrl") or ""
-        domains = data.get("stream_domains") or data.get("streamDomains") or []
+        stream_url = data.get("stream_url") or ""
+        domains = data.get("stream_domains") or []
         if isinstance(domains, str):
             domains = [domains]
         if not stream_url or not domains:
             return None
-        domain = domains[0]
-        if not str(domain).startswith("http"):
-            domain = "https://" + str(domain).lstrip("/")
-        return f"{str(domain).rstrip('/')}/{stream_url.strip('/')}/eng.ass"
+        domain = str(domains[0])
+        if not domain.startswith("http"):
+            domain = "https://" + domain.lstrip("/")
+        return f"{domain.rstrip('/')}/{stream_url.strip('/')}/eng.ass"
     except Exception:
         return None
 
@@ -483,22 +499,16 @@ def scrape_series_info(
     info = SeriesInfo()
     series_url = episode_url_to_series_url(episode_or_series_url)
     info.series_url = series_url
-    ch = _cookies_header(cookies_file)
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        "Referer": "https://hstream.moe/",
-    }
-    if ch:
-        headers["Cookie"] = ch
+    s = _session(cookies_file)
     try:
-        r = requests.get(series_url, headers=headers, timeout=30)
+        r = s.get(series_url, timeout=30)
         if r.status_code != 200:
             return info
         page = r.text
     except Exception:
         return info
 
-    m = re.search(r"<h1[^>]*>(.*?)</h1>", page, re.IGNORECASE | re.DOTALL)
+    m = re.search(r"<h1[^>]*>(.*?)</h1>", page, re.I | re.S)
     if m:
         info.title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
     if not info.title:
@@ -510,14 +520,14 @@ def scrape_series_info(
     dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", page)
     if dates:
         info.year = min(set(dates))[:4]
-    m = re.search(r"Episodes\s*\((\d+)\)", page, re.IGNORECASE)
+    m = re.search(r"Episodes\s*\((\d+)\)", page, re.I)
     if m:
         info.episodes = int(m.group(1))
         info.status = "Completed"
     covers = re.findall(
         r'((?:https://hstream\.moe)?/images/hentai/[^"\']+/cover[^"\']+\.webp)',
         page,
-        re.IGNORECASE,
+        re.I,
     )
     if covers:
         u = covers[0]
@@ -572,11 +582,17 @@ def process_url(
             "https://shinobu-str.rorikon-h.xyz",
         ]
         for host in hosts:
-            for y in (year, "2026", "2025", "2024", "2023"):
+            for y in (year, "2026", "2025", "2024", "2008", "2023"):
                 for slug in candidates:
-                    sub_url = f"{host}/{y}/{slug}/E{ep_num:02d}/eng.ass"
-                    if download_subtitle(sub_url, sub_path):
-                        sub_ok = True
+                    alt = ".".join(w.capitalize() for w in slug_part.split("-"))
+                    for su in (
+                        f"{host}/{y}/{slug}/E{ep_num:02d}/eng.ass",
+                        f"{host}/{y}/{alt}/E{ep_num:02d}/eng.ass",
+                    ):
+                        if download_subtitle(su, sub_path):
+                            sub_ok = True
+                            break
+                    if sub_ok:
                         break
                 if sub_ok:
                     break
