@@ -6,7 +6,6 @@ from __future__ import annotations
 import contextlib
 import html as html_lib
 import re
-import shutil
 import subprocess
 import sys
 import time
@@ -123,7 +122,7 @@ def resolve_stream_urls(
         r'id=["\']e_id["\'][^>]*value=["\']([^"\']+)["\']'
         r'|value=["\']([^"\']+)["\'][^>]*id=["\']e_id["\']',
         html,
-        re.I,
+        re.IGNORECASE,
     )
     e_id = (m.group(1) or m.group(2)) if m else None
     if not e_id:
@@ -198,7 +197,7 @@ def _download_http(
         "Referer": "https://hstream.moe/",
         "Origin": "https://hstream.moe",
     }
-    log(f"HTTP download: {url.split('/')[-1]}")
+    log(f"HTTP download: {url.rsplit('/', maxsplit=1)[-1]}")
     with requests.get(url, headers=headers, stream=True, timeout=60) as r:
         r.raise_for_status()
         total = int(r.headers.get("content-length") or 0)
@@ -246,7 +245,7 @@ def download_video(
     last_err: Exception | None = None
 
     for s in streams:
-        if not (s.endswith(".mp4") or s.endswith(".webm")):
+        if not (s.endswith((".mp4", ".webm"))):
             continue
         name = s.rstrip("/").split("/")[-1]
         slug = url.rstrip("/").split("/")[-1]
@@ -354,7 +353,8 @@ def download_video(
     files = [
         p
         for p in dest.glob("*")
-        if p.is_file() and p.suffix.lower() not in {".ass", ".part", ".ytdl", ".temp"}
+        if p.is_file()
+        and p.suffix.lower() not in {".ass", ".part", ".ytdl", ".temp"}
     ]
     if not files:
         raise FileNotFoundError("No video file produced.")
@@ -400,7 +400,7 @@ def resolve_subtitle_url(
                 r'href=["\'](https?://[^"\']+?/eng\.ass)["\']',
                 r'href=["\'](https?://[^"\']+?\.ass)["\']',
             ]:
-                for m in re.finditer(pat, html, re.I):
+                for m in re.finditer(pat, html, re.IGNORECASE):
                     if m.group(1) not in found:
                         found.append(m.group(1))
             for u in found:
@@ -415,7 +415,7 @@ def resolve_subtitle_url(
         m = re.search(
             r'id=["\']e_id["\'][^>]*value=["\']([^"\']+)["\']|value=["\']([^"\']+)["\'][^>]*id=["\']e_id["\']',
             html or "",
-            re.I,
+            re.IGNORECASE,
         )
         e_id = (m.group(1) or m.group(2)) if m else None
         if not e_id:
@@ -508,7 +508,7 @@ def scrape_series_info(
     except Exception:
         return info
 
-    m = re.search(r"<h1[^>]*>(.*?)</h1>", page, re.I | re.S)
+    m = re.search(r"<h1[^>]*>(.*?)</h1>", page, re.IGNORECASE | re.DOTALL)
     if m:
         info.title = re.sub(r"<[^>]+>", "", m.group(1)).strip()
     if not info.title:
@@ -520,14 +520,14 @@ def scrape_series_info(
     dates = re.findall(r"\b(20\d{2}-\d{2}-\d{2})\b", page)
     if dates:
         info.year = min(set(dates))[:4]
-    m = re.search(r"Episodes\s*\((\d+)\)", page, re.I)
+    m = re.search(r"Episodes\s*\((\d+)\)", page, re.IGNORECASE)
     if m:
         info.episodes = int(m.group(1))
         info.status = "Completed"
     covers = re.findall(
         r'((?:https://hstream\.moe)?/images/hentai/[^"\']+/cover[^"\']+\.webp)',
         page,
-        re.I,
+        re.IGNORECASE,
     )
     if covers:
         u = covers[0]
