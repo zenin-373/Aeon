@@ -42,7 +42,17 @@ def ensure_dependencies(progress: ProgressCallback | None = None) -> None:
 
     with contextlib.suppress(Exception):
         subprocess.run(
-            [sys.executable, "-m", "pip", "install", "-q", "yt-dlp", "requests"],
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "-U",
+                "yt-dlp",
+                "requests",
+                "hanime-plugin",
+            ],
             check=False,
             capture_output=True,
         )
@@ -62,12 +72,134 @@ def _progress_bar(pct: float, width: int = 10) -> str:
     return "●" * filled + "○" * (width - filled)
 
 
+def _cookies_header(cookies_file: Path | None) -> str | None:
+    if not cookies_file or not cookies_file.is_file():
+        return None
+    parts = []
+    for line in cookies_file.read_text(errors="ignore").splitlines():
+        if not line or line.startswith("#"):
+            continue
+        cols = line.split("\t")
+        if len(cols) >= 7 and "hstream.moe" in cols[0]:
+            parts.append(f"{cols[5]}={cols[6]}")
+    return "; ".join(parts) if parts else None
+
+
+def resolve_stream_urls(
+    page_url: str,
+    cookies_file: Path | None = None,
+    progress: ProgressCallback | None = None,
+) -> list[str]:
+    """Direct media URLs via /player/api — stock yt-dlp cannot extract hstream.moe."""
+
+    def log(msg: str) -> None:
+        if progress:
+            progress(msg)
+
+    ch = _cookies_header(cookies_file)
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Referer": "https://hstream.moe/",
+    }
+    if ch:
+        headers["Cookie"] = ch
+
+    html = ""
+    try:
+        r = requests.get(page_url, headers=headers, timeout=30)
+        if r.status_code == 200:
+            html = r.text
+    except Exception as e:
+        log(f"page fetch failed: {e}")
+        return []
+
+    m = re.search(
+        r'id=["\']e_id["\'][^>]*value=["\']([^"\']+)["\']'
+        r'|value=["\']([^"\']+)["\'][^>]*id=["\']e_id["\']',
+        html or "",
+        re.I,
+    )
+    e_id = (m.group(1) or m.group(2)) if m else None
+    if not e_id:
+        log("no e_id on page")
+        return []
+
+    api = dict(headers)
+    api["Content-Type"] = "application/json"
+    api["X-Requested-With"] = "XMLHttpRequest"
+    if ch:
+        for part in ch.split(";"):
+            part = part.strip()
+            if part.upper().startswith("XSRF-TOKEN="):
+                api["X-XSRF-TOKEN"] = unquote(part.split("=", 1)[1])
+                break
+
+    try:
+        resp = requests.post(
+            "https://hstream.moe/player/api",
+            headers=api,
+            json={"episode_id": e_id},
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            resp = requests.post(
+                "https://hstream.moe/player/api",
+                headers=api,
+                data={"episode_id": e_id},
+                timeout=30,
+            )
+        if resp.status_code != 200:
+            log(f"player API HTTP {resp.status_code}")
+            return []
+        data = resp.json()
+    except Exception as e:
+        log(f"player API failed: {e}")
+        return []
+
+    stream_url = data.get("stream_url") or data.get("streamUrl") or ""
+    domains = data.get("stream_domains") or data.get("streamDomains") or []
+    resolution = str(data.get("resolution") or "720p").lower()
+    if isinstance(domains, str):
+        domains = [domains]
+    if not stream_url or not domains:
+        log("player API missing stream fields")
+        return []
+
+    domain = str(domains[0])
+    if not domain.startswith("http"):
+        domain = "https://" + domain.lstrip("/")
+    base = f"{domain.rstrip('/')}/{stream_url.strip('/')}"
+
+    candidates: list[str] = []
+    if "4k" in resolution or "2160" in resolution or "1080" in resolution:
+        candidates += [
+            f"{base}/av1.1080p.webm",
+            f"{base}/1080/manifest.mpd",
+            f"{base}/x264.720p.mp4",
+            f"{base}/720/manifest.mpd",
+        ]
+    else:
+        candidates += [
+            f"{base}/x264.720p.mp4",
+            f"{base}/720/manifest.mpd",
+            f"{base}/av1.1080p.webm",
+            f"{base}/1080/manifest.mpd",
+        ]
+    log(f"resolved {len(candidates)} stream candidate(s)")
+    return candidates
+
+
 def download_video(
     url: str,
     dest: Path,
     cookies_file: Path | None = None,
     progress: ProgressCallback | None = None,
 ) -> Path:
+    """Download via hanime-plugin and/or player-API direct streams."""
+
     def log(msg: str) -> None:
         if progress:
             progress(msg)
@@ -79,8 +211,30 @@ def download_video(
     except ImportError as e:
         raise RuntimeError("yt-dlp is required") from e
 
+    with contextlib.suppress(Exception):
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "-q",
+                "-U",
+                "hanime-plugin",
+                "yt-dlp",
+            ],
+            check=False,
+            capture_output=True,
+        )
+
     output_template = str(dest / "%(title)s.%(ext)s")
-    format_tries = ["best", "bestvideo*+bestaudio/best", "best[height<=1080]"]
+    format_tries = [
+        "best",
+        "bestvideo*+bestaudio/best",
+        "best[height<=1080]",
+        "best[height<=720]",
+    ]
+
     last_update = [0.0]
     last_filename = [""]
 
@@ -112,50 +266,76 @@ def download_video(
                 f"{bar} <b>{pct:.2f}%</b>\n"
                 f"Processed: {_human_bytes(done)}\n"
                 f"Size: {_human_bytes(total) if total else '—'}\n"
-                f"Speed: {_human_bytes(speed)}/s\nETA: {eta_s}"
+                f"Speed: {_human_bytes(speed)}/s\n"
+                f"ETA: {eta_s}\n"
+                f"Tool: yt-dlp"
             )
         elif status == "finished":
             name = d.get("filename") or last_filename[0] or "file"
+            last_filename[0] = name
             progress(f"✅ Download finished\n<code>{Path(name).name}</code>")
 
     last_err: Exception | None = None
     log(f"Downloading: {url}")
-    for fmt in format_tries:
-        ydl_opts = {
-            "format": fmt,
-            "outtmpl": output_template,
-            "noplaylist": True,
-            "retries": 5,
-            "fragment_retries": 5,
-            "concurrent_fragment_downloads": 8,
-            "progress_hooks": [hook],
-            "quiet": True,
-            "no_warnings": True,
-            "noprogress": True,
-        }
-        if shutil.which("aria2c"):
-            ydl_opts["external_downloader"] = "aria2c"
-            ydl_opts["external_downloader_args"] = {
-                "aria2c": ["-x", "16", "-s", "16", "-k", "1M"]
+
+    try_urls: list[str] = [url]
+    try:
+        for s in resolve_stream_urls(url, cookies_file=cookies_file, progress=progress):
+            if s not in try_urls:
+                try_urls.append(s)
+    except Exception as e:
+        log(f"stream resolve skipped: {e}")
+
+    for try_url in try_urls:
+        for fmt in format_tries:
+            ydl_opts = {
+                "format": fmt,
+                "outtmpl": output_template,
+                "noplaylist": True,
+                "retries": 5,
+                "fragment_retries": 5,
+                "concurrent_fragment_downloads": 8,
+                "progress_hooks": [hook],
+                "quiet": True,
+                "no_warnings": True,
+                "noprogress": True,
+                "http_headers": {
+                    "Referer": "https://hstream.moe/",
+                    "Origin": "https://hstream.moe",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/120.0.0.0 Safari/537.36"
+                    ),
+                },
             }
-        if cookies_file and cookies_file.exists():
-            ydl_opts["cookiefile"] = str(cookies_file)
-        try:
-            log(f"  trying format={fmt}")
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
-            last_err = None
+            if shutil.which("aria2c"):
+                ydl_opts["external_downloader"] = "aria2c"
+                ydl_opts["external_downloader_args"] = {
+                    "aria2c": ["-x", "16", "-s", "16", "-k", "1M"]
+                }
+            if cookies_file and cookies_file.exists():
+                ydl_opts["cookiefile"] = str(cookies_file)
+            try:
+                short = try_url if len(try_url) < 90 else try_url[:87] + "..."
+                log(f"  trying {short} · format={fmt}")
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([try_url])
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                continue
+        if last_err is None:
             break
-        except Exception as e:
-            last_err = e
-            continue
+
     if last_err is not None:
         raise RuntimeError(f"Download failed: {last_err}") from last_err
+
     files = [
         p
         for p in dest.glob("*")
-        if p.is_file()
-        and p.suffix.lower() not in {".ass", ".part", ".ytdl", ".temp"}
+        if p.is_file() and p.suffix.lower() not in {".ass", ".part", ".ytdl", ".temp"}
     ]
     if not files:
         raise FileNotFoundError("No video file produced by yt-dlp.")
@@ -174,19 +354,6 @@ def download_subtitle(sub_url: str, sub_path: Path) -> bool:
         return True
     except Exception:
         return False
-
-
-def _cookies_header(cookies_file: Path | None) -> str | None:
-    if not cookies_file or not cookies_file.is_file():
-        return None
-    parts = []
-    for line in cookies_file.read_text(errors="ignore").splitlines():
-        if not line or line.startswith("#"):
-            continue
-        cols = line.split("\t")
-        if len(cols) >= 7 and "hstream.moe" in cols[0]:
-            parts.append(f"{cols[5]}={cols[6]}")
-    return "; ".join(parts) if parts else None
 
 
 def resolve_subtitle_url(
