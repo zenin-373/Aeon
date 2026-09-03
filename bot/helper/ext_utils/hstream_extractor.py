@@ -120,7 +120,7 @@ def resolve_stream_urls(
         r'id=["\']e_id["\'][^>]*value=["\']([^"\']+)["\']'
         r'|value=["\']([^"\']+)["\'][^>]*id=["\']e_id["\']',
         html or "",
-        re.I,
+        re.IGNORECASE,
     )
     e_id = (m.group(1) or m.group(2)) if m else None
     if not e_id:
@@ -280,7 +280,9 @@ def download_video(
 
     try_urls: list[str] = [url]
     try:
-        for s in resolve_stream_urls(url, cookies_file=cookies_file, progress=progress):
+        for s in resolve_stream_urls(
+            url, cookies_file=cookies_file, progress=progress
+        ):
             if s not in try_urls:
                 try_urls.append(s)
     except Exception as e:
@@ -335,7 +337,8 @@ def download_video(
     files = [
         p
         for p in dest.glob("*")
-        if p.is_file() and p.suffix.lower() not in {".ass", ".part", ".ytdl", ".temp"}
+        if p.is_file()
+        and p.suffix.lower() not in {".ass", ".part", ".ytdl", ".temp"}
     ]
     if not files:
         raise FileNotFoundError("No video file produced by yt-dlp.")
